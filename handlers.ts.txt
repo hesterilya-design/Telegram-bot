@@ -1,0 +1,221 @@
+import TelegramBot from "node-telegram-bot-api";
+import { getCategoryById, getItemById } from "./catalog.js";
+import { ADMIN_ID } from "./config.js";
+import {
+  mainMenuKeyboard,
+  categoryKeyboard,
+  variantsKeyboard,
+  variantDetailKeyboard,
+  quantityKeyboard,
+  timeSlotsKeyboard,
+} from "./keyboards.js";
+
+function parseTimeFromCallback(raw: string): string {
+  const [startRaw, endRaw] = raw.split("_");
+  const start = startRaw.slice(0, 2) + ":" + startRaw.slice(2);
+  const end = endRaw.slice(0, 2) + ":" + endRaw.slice(2);
+  return `${start}-${end}`;
+}
+
+async function safeEdit(
+  bot: TelegramBot,
+  chatId: number,
+  msgId: number,
+  text: string,
+  options: TelegramBot.EditMessageTextOptions
+): Promise<void> {
+  try {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...options });
+  } catch (err: any) {
+    if (err?.response?.body?.description?.includes("message is not modified")) return;
+    console.error("editMessageText error:", err?.response?.body?.description ?? err);
+  }
+}
+
+export function registerHandlers(bot: TelegramBot): void {
+  bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, "🛍 *Наш каталог*\n\nОберіть категорію:", {
+      parse_mode: "Markdown",
+      reply_markup: mainMenuKeyboard(),
+    });
+  });
+
+  bot.on("callback_query", async (query) => {
+    if (!query.data || !query.message) return;
+
+    const chatId = query.message.chat.id;
+    const msgId = query.message.message_id;
+    const parts = query.data.split(":");
+
+    try {
+      await bot.answerCallbackQuery(query.id);
+    } catch {}
+
+    try {
+      switch (parts[0]) {
+        case "bk": {
+          if (parts[1] === "m") {
+            await safeEdit(bot, chatId, msgId, "🛍 *Наш каталог*\n\nОберіть категорію:", {
+              parse_mode: "Markdown",
+              reply_markup: mainMenuKeyboard(),
+            });
+          }
+          break;
+        }
+
+        case "cat": {
+          const catId = parts[1];
+          const cat = getCategoryById(catId);
+          if (!cat) break;
+          await safeEdit(bot, chatId, msgId, `📁 *${cat.label}*\n\nОберіть товар:`, {
+            parse_mode: "Markdown",
+            reply_markup: categoryKeyboard(catId),
+          });
+          break;
+        }
+
+        case "item": {
+          const [, catId, itemId] = parts;
+          const item = getItemById(catId, itemId);
+          if (!item) break;
+
+          if (item.variants.length === 0) {
+            await safeEdit(bot, chatId, msgId, `🔴 *${item.name}*\n\n❌ Немає в наявності`, {
+              parse_mode: "Markdown",
+              reply_markup: { inline_keyboard: [[{ text: "◀️ До каталогу", callback_data: `cat:${catId}` }]] },
+            });
+            break;
+          }
+
+          if (item.variants.length === 1) {
+            const v = item.variants[0];
+            const status = v.available ? "✅ В наявності" : "❌ Немає в наявності";
+            const price = item.available ? `\n💰 Ціна: *${item.price}.00 грн*` : "";
+            await safeEdit(bot, chatId, msgId, `📦 *${item.name}*\n\n${status}${price}`, {
+              parse_mode: "Markdown",
+              reply_markup: variantDetailKeyboard(catId, itemId, 0, v.available),
+            });
+            break;
+          }
+
+          await safeEdit(bot, chatId, msgId, `📁 *${item.name}*\n\n👇 Натисніть на смак щоб замовити:`, {
+            parse_mode: "Markdown",
+            reply_markup: variantsKeyboard(catId, item),
+          });
+          break;
+        }
+
+        case "var": {
+          const [, catId, itemId, varIdxStr] = parts;
+          const varIdx = parseInt(varIdxStr);
+          const item = getItemById(catId, itemId);
+          if (!item) break;
+
+          const variant = item.variants[varIdx];
+          if (!variant) break;
+
+          const status = variant.available ? "✅ В наявності" : "❌ Немає в наявності";
+          const price = variant.available ? `\n💰 Ціна: *${item.price}.00 грн*` : "";
+          await safeEdit(
+            bot, chatId, msgId,
+            `📦 *${item.name}*\n🔹 Смак: *${variant.name}*\n\n${status}${price}`,
+            { parse_mode: "Markdown", reply_markup: variantDetailKeyboard(catId, itemId, varIdx, variant.available) }
+          );
+          break;
+        }
+
+        case "ord": {
+          const [, catId, itemId, varIdxStr] = parts;
+          const varIdx = parseInt(varIdxStr);
+          const item = getItemById(catId, itemId);
+          if (!item) break;
+
+          const variant = item.variants[varIdx];
+          const variantName = variant?.name ?? item.name;
+          await safeEdit(
+            bot, chatId, msgId,
+            `🛒 *${item.name}*\n🔹 Смак: *${variantName}*\n\nОберіть кількість:`,
+            { parse_mode: "Markdown", reply_markup: quantityKeyboard(catId, itemId, varIdx) }
+          );
+          break;
+        }
+
+        case "qty": {
+          const [, catId, itemId, varIdxStr, qtyStr] = parts;
+          const varIdx = parseInt(varIdxStr);
+          const qty = parseInt(qtyStr);
+          const item = getItemById(catId, itemId);
+          if (!item) break;
+
+          const variant = item.variants[varIdx];
+          const variantName = variant?.name ?? item.name;
+          const kb = timeSlotsKeyboard(catId, itemId, varIdx, qty);
+
+          if (kb.inline_keyboard.length <= 1) {
+            await safeEdit(
+              bot, chatId, msgId,
+              `😔 На сьогодні замовлення вже недоступні.\n\nЗаходьте завтра!`,
+              {
+                parse_mode: "Markdown",
+                reply_markup: { inline_keyboard: [[{ text: "🏠 На головну", callback_data: "bk:m" }]] },
+              }
+            );
+            break;
+          }
+
+          await safeEdit(
+            bot, chatId, msgId,
+            `🛒 *${item.name}*\n🔹 Смак: *${variantName}*\n📦 Кількість: *${qty}*\n\nОберіть час замовлення:`,
+            { parse_mode: "Markdown", reply_markup: kb }
+          );
+          break;
+        }
+
+        case "tm": {
+          const [, catId, itemId, varIdxStr, qtyStr, timeRaw] = parts;
+          const varIdx = parseInt(varIdxStr);
+          const qty = parseInt(qtyStr);
+          const time = parseTimeFromCallback(timeRaw);
+          const item = getItemById(catId, itemId);
+          if (!item) break;
+
+          const variant = item.variants[varIdx];
+          const variantName = variant?.name ?? item.name;
+          const username = query.from.username ? `@${query.from.username}` : "немає username";
+
+          await safeEdit(
+            bot, chatId, msgId,
+            `✅ *Замовлення прийнято!*\n\n` +
+            `📦 Товар: *${item.name}*\n` +
+            `🔹 Смак: *${variantName}*\n` +
+            `🔢 Кількість: *${qty}*\n` +
+            `⏰ Час замовлення: *${time}*`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: { inline_keyboard: [[{ text: "🏠 На головну", callback_data: "bk:m" }]] },
+            }
+          );
+
+          await bot.sendMessage(
+            ADMIN_ID,
+            `🛒 *Нове замовлення!*\n\n` +
+            `📦 Товар: *${item.name}*\n` +
+            `🔹 Смак: *${variantName}*\n` +
+            `🔢 Кількість: *${qty}*\n` +
+            `⏰ Час замовлення: *${time}*\n` +
+            `👤 Username: ${username}\n` +
+            `🆔 Telegram ID: \`${query.from.id}\``,
+            { parse_mode: "Markdown" }
+          );
+          break;
+        }
+      }
+    } catch (err: any) {
+      console.error("Handler error:", err?.response?.body ?? err?.message ?? err);
+    }
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection (ignored):", reason);
+  });
+}
